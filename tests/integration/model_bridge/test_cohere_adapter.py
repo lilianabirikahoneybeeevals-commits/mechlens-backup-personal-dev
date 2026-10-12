@@ -7,6 +7,7 @@ IMPORTANT: TransformerBridge.forward currently delegates to self.original_model.
 The explicit non-delegation gate below is intentionally expected to FAIL until
 an independent processed-weight forward is wired up. Do not xfail or skip it.
 The tiny fixture has use_qk_norm=False, so it does not validate QK-norm.
+Attention-pattern parity uses post-softmax weights, not pre-softmax attention scores.
 """
 
 from typing import Any
@@ -25,6 +26,7 @@ from transformer_lens.model_bridge.generalized_components.position_embeddings_at
 MODEL = "trl-internal-testing/tiny-CohereForCausalLM"
 LOGIT_TOL = 1e-4
 RESID_TOL = 1e-4
+PATTERN_TOL = 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -49,6 +51,18 @@ def cohere_bridge_processed():
 @pytest.fixture(scope="module")
 def cohere_hf() -> Any:
     return AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32).eval()
+
+
+@pytest.fixture(scope="module")
+def cohere_hf_eager() -> Any:
+    """Independent reference whose returned attention weights use eager attention.
+
+    An implementation that cannot expose output.attentions must fail the comparison,
+    not skip it or silently substitute masks / pre-softmax score tensors.
+    """
+    return AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype=torch.float32, attn_implementation="eager"
+    ).eval()
 
 
 def _input_ids(length: int, vocab_size: int) -> torch.Tensor:
@@ -257,6 +271,63 @@ class TestCohereProcessedAcceptance:
         _assert_max_delta(cache[f"blocks.{len(cohere_hf.model.layers)-1}.hook_resid_post"],
                           hf_values["final_norm_input"], RESID_TOL,
                           f"final norm input sequence_length={seq_len}")
+
+    @pytest.mark.parametrize("seq_len", [4, 128])
+    def test_processed_attention_patterns_match_hf_eager(
+        self, cohere_bridge_processed, cohere_hf_eager, seq_len
+    ):
+        """Numerical parity of POST-softmax attention probabilities per layer.
+
+        `blocks.i.attn.hook_pattern` is [batch, heads, query_pos, key_pos]
+        after masked softmax. HF `output.attentions[i]` has the same semantics
+        when eager attention returns attentions. Do not compare to
+        `hook_attn_scores` (pre-softmax), a mask, or an attention output vector.
+
+        This comparison does NOT establish independent converted execution:
+        TransformerBridge.forward currently invokes original_model.forward.
+        The mandatory anti-delegation test below is still expected to fail.
+        """
+        assert cohere_bridge_processed.original_model is not cohere_hf_eager
+        assert next(cohere_bridge_processed.original_model.parameters()).dtype == torch.float32
+        tokens = _input_ids(seq_len, cohere_hf_eager.config.vocab_size)
+
+        with torch.inference_mode():
+            hf_result = cohere_hf_eager(
+                input_ids=tokens, output_attentions=True, use_cache=False,
+                return_dict=True,
+            )
+        hf_patterns = hf_result.attentions
+        n_layers = len(cohere_hf_eager.model.layers)
+        assert hf_patterns is not None, (
+            "HF returned no attention probabilities; require eager output_attentions, "
+            "not a silent skip or an incompatible replacement tensor"
+        )
+        assert len(hf_patterns) == n_layers
+
+        with torch.inference_mode():
+            _, cache = cohere_bridge_processed.run_with_cache(tokens, use_cache=False)
+
+        for i, hf_pattern in enumerate(hf_patterns):
+            key = f"blocks.{i}.attn.hook_pattern"
+            assert key in cache, f"Bridge did not expose post-softmax attention hook: {key}"
+            bridge_pattern = cache[key]
+            assert isinstance(hf_pattern, torch.Tensor)
+            assert isinstance(bridge_pattern, torch.Tensor)
+            assert hf_pattern.ndim == bridge_pattern.ndim == 4, (
+                f"{key}: expected [batch, heads, query, key] attention probabilities; "
+                f"HF={tuple(hf_pattern.shape)} bridge={tuple(bridge_pattern.shape)}"
+            )
+            assert hf_pattern.shape[-2:] == (seq_len, seq_len)
+            assert bridge_pattern.shape[-2:] == (seq_len, seq_len)
+            _assert_max_delta(bridge_pattern, hf_pattern, PATTERN_TOL,
+                              f"{key} post_softmax seq_len={seq_len}")
+            # A probability tensor should normalize over key positions. This also
+            # protects against accidentally comparing unnormalized attention scores.
+            ones = torch.ones_like(hf_pattern.sum(dim=-1))
+            _assert_max_delta(hf_pattern.sum(dim=-1), ones, PATTERN_TOL,
+                              f"HF {key} probability rows seq_len={seq_len}")
+            _assert_max_delta(bridge_pattern.sum(dim=-1), ones, PATTERN_TOL,
+                              f"bridge {key} probability rows seq_len={seq_len}")
 
     def test_processed_forward_does_not_delegate_to_hf_model(self, cohere_bridge_processed):
         """Mandatory anti-tautology gate, EXPECTED TO FAIL with current bridge.py.
